@@ -1,0 +1,135 @@
+diff --git a/libhttpd/api.c b/libhttpd/api.c
+index a59d55a..7f9456c 100644
+--- a/libhttpd/api.c
++++ b/libhttpd/api.c
+@@ -301,6 +301,64 @@ httpd *server;
+ }
+ 
+ request *
++httpdGetConnectionEpoll(server, eventList, events_num,timeout)
++httpd *server;
++struct epoll_event *eventList;
++int events_num;
++int timeout;
++{
++    int ret = 0;
++    int i = 0;
++    struct sockaddr_in addr;
++    socklen_t addrLen;
++    char *ipaddr;
++    request *r;
++    server->lastError = 0;
++    ret = epoll_wait(epollfd, eventList, events_num, timeout);
++    if (ret < 0) {
++        server->lastError = -1;
++        return (NULL);
++    } else {
++        for ( i = 0; i < ret; i++) {
++           if (eventList[i].data.fd == webserver->serverSock) {
++               /* Allocate request struct */
++               r = (request *) malloc(sizeof(request));
++               if (r == NULL) {
++                   server->lastError = -3;
++                   return (NULL);
++               }
++               memset((void *)r, 0, sizeof(request));
++               /* Get on with it */
++               bzero(&addr, sizeof(addr));
++               addrLen = sizeof(addr);
++               r->clientSock = accept(server->serverSock, (struct sockaddr *)&addr, &addrLen);
++               ipaddr = inet_ntoa(addr.sin_addr);
++               if (ipaddr) {
++                   strncpy(r->clientAddr, ipaddr, HTTP_IP_ADDR_LEN);
++                   r->clientAddr[HTTP_IP_ADDR_LEN - 1] = 0;
++               } else
++                   *r->clientAddr = 0;
++               r->readBufRemain = 0;
++               r->readBufPtr = NULL;
++
++               /*
++                ** Check the default ACL
++                */
++               if (server->defaultAcl) {
++                   if (httpdCheckAcl(server, r, server->defaultAcl)
++                       == HTTP_ACL_DENY) {
++                       httpdEndRequest(r);
++                       server->lastError = 2;
++                       return (NULL);
++                   }
++               }
++               return (r);
++           }
++        }
++    }
++}
++
++request *
+ httpdGetConnection(server, timeout)
+ httpd *server;
+ struct timeval *timeout;
+diff --git a/libhttpd/httpd.h b/libhttpd/httpd.h
+index eb5012d..3b11609 100644
+--- a/libhttpd/httpd.h
++++ b/libhttpd/httpd.h
+@@ -162,6 +162,7 @@ extern "C" {
+     int httpdAddVariable __ANSI_PROTO((request *, const char *, const char *));
+     int httpdSetVariableValue __ANSI_PROTO((request *, const char *, const char *));
+     request *httpdGetConnection __ANSI_PROTO((httpd *, struct timeval *));
++    request *httpdGetConnectionEpoll __ANSI_PROTO((httpd *,struct epoll_event *, int, int));
+     int httpdReadRequest __ANSI_PROTO((httpd *, request *));
+     int httpdCheckAcl __ANSI_PROTO((httpd *, request *, httpAcl *));
+     int httpdAuthenticate __ANSI_PROTO((request *, const char *));
+diff --git a/src/gateway.c b/src/gateway.c
+index d5eb6eb..2c832be 100644
+--- a/src/gateway.c
++++ b/src/gateway.c
+@@ -33,7 +33,7 @@
+ #include <signal.h>
+ #include <errno.h>
+ #include <time.h>
+-
++#include <sys/epoll.h>
+ /* for strerror() */
+ #include <string.h>
+ 
+@@ -356,6 +356,10 @@ main_loop(void)
+     s_config *config = config_get_config();
+     request *r;
+     void **params;
++  
++    /*params for epoll*/
++    int epollfd;
++    struct epoll_event eventList[2]; /*we only poll the server socket so enough*/
+ 
+     /* Set the time when wifidog started */
+     if (!started_time) {
+@@ -408,6 +412,18 @@ main_loop(void)
+     httpdAddCContent(webserver, "/wifidog", "disconnect", 0, NULL, http_callback_disconnect);
+ 
+     httpdSetErrorFunction(webserver, 404, http_callback_404);
++    /*epoll init*/
++    epollfd = epoll_create(2);
++    struct epoll_event event;
++    event.events = EPOLLIN|EPOLLET;
++    event.data.fd = webserver->serverSock;
++
++    /*epoll ctrl: add*/
++    if (epoll_ctl(epollfd, EPOLL_CTL_ADD, webserver->serverSock, &event) < 0){
++        debug(LOG_DEBUG, "add epollfd failed\n");
++        return -1;
++    }
++
+ 
+     /* Reset the firewall (if WiFiDog crashed) */
+     fw_destroy();
+@@ -443,8 +459,8 @@ main_loop(void)
+ 
+     debug(LOG_NOTICE, "Waiting for connections");
+     while (1) {
+-        r = httpdGetConnection(webserver, NULL);
+-
++        //r = httpdGetConnection(webserver, NULL);
++        httpdGetConnectionEpoll(webserver, eventList, 2, 300);
+         /* We can't convert this to a switch because there might be
+          * values that are not -1, 0 or 1. */
+         if (webserver->lastError == -1) {
